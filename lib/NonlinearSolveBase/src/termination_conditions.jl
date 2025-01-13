@@ -9,8 +9,8 @@ const AbsNormModes = Union{
 @concrete mutable struct NonlinearTerminationModeCache{uType, T}
     u::uType
     retcode::ReturnCode.T
-    abstol::T
-    reltol::T
+    abstol
+    reltol
     best_objective_value::T
     mode
     initial_objective
@@ -40,9 +40,8 @@ function CommonSolve.init(
         saved_value_prototype...; abstol = nothing, reltol = nothing, kwargs...
 )
     T = promote_type(eltype(du), eltype(u))
-    abstol = get_tolerance(u, abstol, T)
-    reltol = get_tolerance(u, reltol, T)
-    TT = typeof(abstol)
+    abstol = get_tolerance.(abstol, T)
+    reltol = get_tolerance.(reltol, T)
 
     u_unaliased = mode isa AbstractSafeBestNonlinearTerminationMode ?
                   (ArrayInterface.can_setindex(u) ? copy(u) : u) : nothing
@@ -56,9 +55,9 @@ function CommonSolve.init(
                                 (Utils.nonallocating_maximum(+, du, u) + eps(TT))
             u0_norm = mode.max_stalled_steps === nothing ? nothing : L2_NORM(u)
         end
-        objectives_trace = Vector{TT}(undef, mode.patience_steps)
+        objectives_trace = Vector{T}(undef, mode.patience_steps)
         step_norm_trace = mode.max_stalled_steps === nothing ? nothing :
-                          Vector{TT}(undef, mode.max_stalled_steps)
+                          Vector{T}(undef, mode.max_stalled_steps)
         if step_norm_trace !== nothing &&
            ArrayInterface.can_setindex(u_unaliased) &&
            !(u_unaliased isa Number)
@@ -100,8 +99,8 @@ function SciMLBase.reinit!(
     cache.u = u_unaliased
     cache.retcode = ReturnCode.Default
 
-    cache.abstol = get_tolerance(u, abstol, T)
-    cache.reltol = get_tolerance(u, reltol, T)
+    cache.abstol = get_tolerance.(abstol, T)
+    cache.reltol = get_tolerance.(reltol, T)
     cache.nsteps = 0
     TT = typeof(cache.abstol)
 
@@ -177,7 +176,7 @@ function (cache::NonlinearTerminationModeCache)(
     end
 
     # Main Termination Criteria
-    if objective ≤ criteria
+    if all(objective .≤ criteria)
         cache.retcode = ReturnCode.Success
         return true
     end
@@ -227,6 +226,91 @@ function (cache::NonlinearTerminationModeCache)(
     cache.retcode = ReturnCode.Failure
     return false
 end
+
+
+function (cache::NonlinearTerminationModeCache)(
+    mode::AbstractSafeNonlinearTerminationMode, du, u, uprev, abstol::TT, reltol::TT, args...
+) where {TT <: AbstractArray}
+
+    if mode isa AbsNormSafeTerminationMode || mode isa AbsNormSafeBestTerminationMode
+        objective = Utils.apply_norm(mode.internalnorm, du ./ abstol)
+    else
+        objective = Utils.apply_norm(du ./ ((abs.(du + u) + eps.(reltol)) .* reltol))
+    end
+
+    # Protective Break
+    if !isfinite(objective)
+        cache.retcode = ReturnCode.Unstable
+        return true
+    end
+
+    # By default we turn this off since it have potential for false positives
+    if mode.protective_threshold !== nothing &&
+    objective > cache.initial_objective * mode.protective_threshold * length(du)
+        cache.retcode = ReturnCode.Unstable
+        return true
+    end
+
+    # Check if it is the best solution
+    if mode isa AbstractSafeBestNonlinearTerminationMode &&
+    objective < cache.best_objective_value
+        cache.best_objective_value = objective
+        update_u!!(cache, u)
+        cache.saved_values !== nothing && length(args) ≥ 1 && (cache.saved_values = args)
+    end
+
+    # Main Termination Criteria
+    if objective ≤ 1.0
+        cache.retcode = ReturnCode.Success
+        return true
+    end
+
+    # Terminate if we haven't improved for the last `patience_steps`
+    cache.nsteps += 1
+    cache.nsteps == 1 && (cache.initial_objective = objective)
+    cache.objectives_trace[mod1(cache.nsteps, length(cache.objectives_trace))] = objective
+
+    if objective ≤ mode.patience_objective_multiplier &&
+    cache.nsteps > mode.patience_steps
+        if cache.nsteps < length(cache.objectives_trace)
+            min_obj, max_obj = extrema(@view(cache.objectives_trace[1:(cache.nsteps)]))
+        else
+            min_obj, max_obj = extrema(cache.objectives_trace)
+        end
+        if min_obj < mode.min_max_factor * max_obj
+            cache.retcode = ReturnCode.Stalled
+            return true
+        end
+    end
+
+    # Test for stalling if that is enabled
+    if cache.step_norm_trace !== nothing
+        if ArrayInterface.can_setindex(cache.u_diff_cache) && !(u isa Number)
+            @. cache.u_diff_cache = u - uprev
+        else
+            cache.u_diff_cache = u .- uprev
+        end
+        du_norm = L2_NORM(cache.u_diff_cache)
+        cache.step_norm_trace[mod1(cache.nsteps, length(cache.step_norm_trace))] = du_norm
+        if cache.nsteps > mode.max_stalled_steps
+            max_step_norm = maximum(cache.step_norm_trace)
+            if mode isa AbsNormSafeTerminationMode ||
+            mode isa AbsNormSafeBestTerminationMode
+                stalled_step = max_step_norm ≤ abstol
+            else
+                stalled_step = max_step_norm ≤ reltol * (max_step_norm + cache.u0_norm)
+            end
+            if stalled_step
+                cache.retcode = ReturnCode.Stalled
+                return true
+            end
+        end
+    end
+
+    cache.retcode = ReturnCode.Failure
+    return false
+end
+
 
 # Check Convergence
 function check_convergence(::RelTerminationMode, duₙ, uₙ, __, ___, reltol)
@@ -291,8 +375,8 @@ function init_termination_cache(prob::AbstractNonlinearProblem, abstol, reltol, 
         u, tc::AbstractNonlinearTerminationMode, ::Val
 )
     T = promote_type(eltype(du), eltype(u))
-    abstol = get_tolerance(u, abstol, T)
-    reltol = get_tolerance(u, reltol, T)
+    abstol = get_tolerance.(abstol, T)
+    reltol = get_tolerance.(reltol, T)
     cache = init(prob, tc, du, u; abstol, reltol)
     return abstol, reltol, cache
 end
